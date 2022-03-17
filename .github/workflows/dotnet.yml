@@ -1,0 +1,231 @@
+name: dotnet build and deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource-group-name:
+        required: false
+        description: Azure resource group name (Leave empty to default to '{GITHUB_ACTOR}-sample')
+        type: string
+      location:
+        required: false
+        description: Azure resource group location (Leave empty to default to centralus)
+        type: string
+      deployment-mode:
+        required: true
+        description: Azure deployment mode
+        type: choice
+        options:
+        - Complete
+        - Incremental
+        - Validate
+
+  push:
+    branches:
+    paths:
+    - .github/workflows/dotnet.yml
+    - bicep/main.bicep
+    - src/**
+  pull_request:
+    branches: [ main ]
+
+env:
+  IS_MAIN_PUSH: ${{ github.ref == 'refs/heads/main' }}
+  AZURE_RESOURCE_GROUP_NAME: ${{ github.event.inputs.resource-group-name || format('{0}-sample', github.actor) }}
+  AZURE_RESOURCE_GROUP_LOCATION: ${{ github.event.inputs.location || 'centralus' }}
+  AZURE_DEPLOYMENT_NAME: ${{ format('sample.{0}.{1}', github.actor, github.run_id) }}
+  AZURE_DEPLOYMENT_MODE: >-
+    ${{ 
+      github.event.inputs.deployment-mode || 
+      (github.ref == 'refs/heads/main' && 'Complete' || 'Validate')
+    }}
+  BUILD_CONFIGURATION: Release
+  MAIN_BICEP_TEMPLATE_PATH: ./bicep/main.bicep
+  DOTNET_VERSION: 6.0.x
+  # These should be pulled from secrets, github will mask the output from being shown in logs
+  ADDITIONAL_KEY_VAULT_SECRETS: >-
+    {
+      \"secrets\": [
+          {\"name\": \"Sample--Secret\", \"secret\": \"Sample-Secret\" }
+      ]
+    }
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --no-restore
+
+    - name: Test
+      run: dotnet test --no-build --settings coverlet.runsettings.xml
+
+    - name: Code Coverage
+      run: |
+        dotnet tool install --tool-path . dotnet-reportgenerator-globaltool
+        mkdir code-coverage
+        ./reportgenerator -reports:./**/coverage.cobertura.xml -targetdir:./code-coverage -reporttypes:"Cobertura;HtmlSummary"
+
+    - name: Publish Code Coverage
+      uses: actions/upload-artifact@v2
+      with:
+        name: sample-code-coverage
+        path: ./code-coverage/
+
+    - name: Publish WebApi
+      if: success() && (env.IS_MAIN_PUSH == 'true' || github.event_name == 'workflow_dispatch')
+      run: dotnet publish src/Sample.WebApi/Sample.WebApi.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --output published/Sample.WebApi
+
+    - name: Upload WebApi Build Artifact
+      if: success() && (env.IS_MAIN_PUSH == 'true' || github.event_name == 'workflow_dispatch')
+      uses: actions/upload-artifact@v2
+      with:
+        name: Sample.WebApi
+        path: published/Sample.WebApi
+
+    - name: Publish Functions
+      if: success() && (env.IS_MAIN_PUSH == 'true' || github.event_name == 'workflow_dispatch')
+      run: dotnet publish src/Sample.Functions/Sample.Functions.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --output published/Sample.Functions
+
+    - name: Upload Functions Build Artifact
+      if: success() && (env.IS_MAIN_PUSH == 'true' || github.event_name == 'workflow_dispatch')
+      uses: actions/upload-artifact@v2
+      with:
+        name: Sample.Functions
+        path: published/Sample.Functions
+
+    - name: Last step diagnostics
+      if: always()
+      run: |
+        pwd
+        printenv | sort
+        ls -alFR -I.git
+
+  deploy:
+
+    runs-on: ubuntu-latest
+    needs: build
+    if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch')
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Download Sample.WebApi
+      uses: actions/download-artifact@v2.0.8
+      with:
+        name: Sample.WebApi
+        path: packages/Sample.WebApi
+
+    - name: Download Sample.Functions
+      uses: actions/download-artifact@v2.0.8
+      with:
+        name: Sample.Functions
+        path: packages/Sample.Functions
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set current Azure Subscription
+      run: |
+        az account show
+        echo "AZURE_SUBSCRIPTION_ID=$(az account show --query "id" --output tsv)" >> $GITHUB_ENV
+        echo "Logged in! 🎉"
+
+    - name: Create Azure Resource Group
+      uses: Azure/CLI@v1
+      with:
+        inlineScript: |
+          #!/bin/bash
+          az group create --name $AZURE_RESOURCE_GROUP_NAME --location $AZURE_RESOURCE_GROUP_LOCATION
+
+    - name: Deploy bicep 💪
+      id: azure-deploy
+      uses: azure/arm-deploy@v1
+      with:
+        subscriptionId: ${{ env.AZURE_SUBSCRIPTION_ID }}
+        resourceGroupName: ${{ env.AZURE_RESOURCE_GROUP_NAME }}
+        deploymentMode: ${{ env.AZURE_DEPLOYMENT_MODE }}
+        deploymentName: ${{ env.AZURE_DEPLOYMENT_NAME }}
+        template: ${{ env.MAIN_BICEP_TEMPLATE_PATH }}
+        failOnStdErr: false
+        parameters: >-
+          additionalSecrets="${{ env.ADDITIONAL_KEY_VAULT_SECRETS }}"
+          developerObjectIdKeyVaultAccessPolicy="${{ secrets.AZURE_DEVELOPER_OBJECT_ID }}"
+
+    - name: Deploy Sample.Functions
+      uses: Azure/functions-action@v1
+      with:
+        app-name: ${{ env.AZURE_RESOURCE_GROUP_NAME }}-functions
+        package: packages/Sample.Functions
+
+    - name: Sample.Function Health Check
+      uses: Azure/CLI@v1
+      env:
+        HOST_TO_TEST: ${{ steps.azure-deploy.outputs.functionsAppHealthCheckEndpoint }}
+      with:
+        inlineScript: |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "Getting key..."
+          # Force key creation in the key vault (find better way)
+          az functionapp function keys list \
+            --resource-group $AZURE_RESOURCE_GROUP_NAME \
+            --name "$AZURE_RESOURCE_GROUP_NAME-functions" \
+            --function-name HelloWorldSecure > /dev/null
+
+          echo "Testing healthcheck..."
+          curl $HOST_TO_TEST --retry 10 --retry-delay 5 --silent --fail --output /dev/null && true || false
+
+    - name: Deploy Sample.WebApi
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_RESOURCE_GROUP_NAME }}
+        package: packages/Sample.WebApi
+
+    - name: Sample.WebApi Health Check
+      uses: Azure/CLI@v1
+      env:
+        HOST_TO_TEST: ${{ steps.azure-deploy.outputs.webAppHealthCheckEndpoint }}
+      with:
+        inlineScript: |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "Testing healthcheck..."
+          curl $HOST_TO_TEST --retry 10 --retry-delay 5 --silent --fail --output /dev/null && true || false
+
+    - name: Save deployment Output
+      env:
+        AZURE_DEPLOY_OUTPUT: ${{ toJSON(steps.azure-deploy.outputs) }}
+      run: |
+        mkdir artifacts
+        echo $AZURE_DEPLOY_OUTPUT
+        echo $AZURE_DEPLOY_OUTPUT >> artifacts/deployment.json
+
+    - name: Upload Azure Deploy Output
+      uses: actions/upload-artifact@v2
+      with:
+        name: DeploymentOutput
+        path: artifacts
+
+    - name: Last step diagnostics
+      if: always()
+      run: |
+        pwd
+        printenv | sort
+        ls -alFR -I.git

@@ -1,0 +1,58 @@
+name: deploy and manage workflow key vault
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource-group-name:
+        required: false
+        type: string
+
+env:
+  AZURE_RESOURCE_GROUP_NAME: ${{ github.event.inputs.resource-group-name || 'mattk09-workflow' }}
+  AZURE_RESOURCE_GROUP_LOCATION: centralus
+
+jobs:
+  generate-and-deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set current Azure Subscription
+      run: |
+        az account show
+        echo "AZURE_SUBSCRIPTION_ID=$(az account show --query "id" --output tsv)" >> $GITHUB_ENV
+        echo "Logged in! 🎉"
+
+    - name: Create Azure Resource Group
+      uses: Azure/CLI@v1
+      with:
+        inlineScript: |
+          #!/bin/bash
+          az group create --name $AZURE_RESOURCE_GROUP_NAME --location $AZURE_RESOURCE_GROUP_LOCATION
+
+    - name: Deploy bicep 💪
+      id: azure-deploy
+      uses: azure/arm-deploy@v1
+      with:
+        subscriptionId: ${{ env.AZURE_SUBSCRIPTION_ID }}
+        resourceGroupName: ${{ env.AZURE_RESOURCE_GROUP_NAME }}
+        template: ./bicep/main-workflow-key-vault.bicep
+        failOnStdErr: false
+        parameters: >-
+          developerObjectIdKeyVaultAccessPolicy="${{ secrets.AZURE_DEVELOPER_OBJECT_ID }}"
+
+    - name: Public Key Artifact
+      env:
+        AZURE_DEPLOY_OUTPUT: ${{ toJSON(steps.azure-deploy.outputs) }}
+      run: |
+        mkdir artifacts
+        echo $AZURE_DEPLOY_OUTPUT >> artifacts/deployment.json
+
+        echo $AZURE_DEPLOY_OUTPUT
